@@ -1,0 +1,198 @@
+trigger:
+- none
+
+pool:
+  name: 'k8s-lab-pool'
+  demands:
+    - Agent.Name -equals k8s-agent-ii
+
+variables:
+  MAVEN_OPTS: "-Dmaven.test.failure.ignore=false"
+
+stages:
+
+- stage: analyzeAndCreateJAR
+  displayName: 'Aanalyze and Create JAR'
+  jobs:
+  - job: analyzeAndCreateJAR
+    displayName: 'Aanalyze and Create JAR'
+    steps:
+    - checkout: self
+    - task: Bash@3
+      displayName: "Create ~/.m2/settings.xml"
+      inputs:
+        targetType: 'inline'
+        script: |
+          set -euo pipefail
+
+          M2_DIR="/home/ubuntu/.m2"
+          SETTINGS_FILE="$M2_DIR/settings.xml"
+
+          mkdir -p "$M2_DIR"
+
+          # Write without expanding ${env.*} placeholders now (quoted heredoc)
+          cat > "$SETTINGS_FILE" <<'EOF'
+          <settings>
+            <servers>
+              <server>
+                <id>nexus-releases</id>
+                <username>$(NEXUS_USER)</username>
+                <password>$(NEXUS_PASS)</password>
+              </server>
+              <server>
+                <id>nexus-snapshots</id>
+                <username>$(NEXUS_USER)</username>
+                <password>$(NEXUS_PASS)</password>
+              </server>
+            </servers>
+
+            <profiles>
+              <profile>
+                <id>sonar</id>
+                <properties>
+                  <sonar.host.url>$(SONAR_HOST_URL)</sonar.host.url>
+                  <!-- Prefer passing token at mvn runtime via -Dsonar.token or env -->
+                </properties>
+              </profile>
+            </profiles>
+
+            <activeProfiles>
+              <activeProfile>sonar</activeProfile>
+            </activeProfiles>
+          </settings>
+          EOF
+          ls -l "$SETTINGS_FILE"
+    
+    - task: Bash@3
+      displayName: "SonarQube Analysis (Maven)"
+      env:
+        SONAR_TOKEN: $(SONAR_TOKEN)
+        SONAR_HOST: $(SONAR_HOST_URL)
+      inputs:
+        targetType: 'inline'
+        script: |
+          set -eux
+
+          mvn -B clean verify sonar:sonar \
+            -Dsonar.host.url="$SONAR_HOST" \
+            -Dsonar.token="$SONAR_TOKEN"
+    
+    - task: Bash@3
+      displayName: "Package JAR with BuildId"
+      inputs:
+        targetType: 'inline'
+        script: |
+          set -eux
+          # Override the version so final jar = MJAR-<BuildId>.jar
+          mvn -B -DskipTests=false \
+            -DfinalName=MJAR-$(Build.BuildId) \
+            package
+
+    - task: Bash@3
+      displayName: "Deploy to Nexus (mvn deploy)"
+      env:
+        NEXUS_USER: $(NEXUS_USER)
+        NEXUS_PASS: $(NEXUS_PASS)
+      inputs:
+        targetType: 'inline'
+        script: |
+          set -eux
+          mvn -B deploy
+        
+- stage: fetchJar
+  displayName: "Fetch latest SNAPSHOT JAR"
+  dependsOn: analyzeAndCreateJAR
+  jobs:
+  - job: fetchJar
+    displayName: "Fetch latest SNAPSHOT JAR"
+    steps:
+    - checkout: self
+
+    - task: Bash@3
+      displayName: "Create ~/.m2/settings.xml (Nexus auth)"
+      inputs:
+        targetType: 'inline'
+        script: |
+          set -euo pipefail
+          M2_DIR="/home/ubuntu/.m2"
+          SETTINGS_FILE="$M2_DIR/settings.xml"
+          mkdir -p "$M2_DIR"
+          cat > "$SETTINGS_FILE" <<'EOF'
+          <settings>
+            <servers>
+              <server>
+                <id>nexus-releases</id>
+                <username>$(NEXUS_USER)</username>
+                <password>$(NEXUS_PASS)</password>
+              </server>
+              <server>
+                <id>nexus-snapshots</id>
+                <username>$(NEXUS_USER)</username>
+                <password>$(NEXUS_PASS)</password>
+              </server>
+            </servers>
+          </settings>
+          EOF
+          ls -l "$SETTINGS_FILE"
+
+    - task: Bash@3
+      displayName: "Resolve & copy latest SNAPSHOT JAR to repo root"
+      inputs:
+        targetType: 'inline'
+        script: |
+          set -eux
+
+          GROUP_ID="com.javaproject"
+          ARTIFACT_ID="database_service_project"
+          VERSION="0.0.7-SNAPSHOT"   # always latest snapshot
+          SNAP_REPO="$(NEXUS_URL)/repository/maven-snapshots"
+
+          # Clean any old copies in repo root to avoid confusion
+          find "$(Build.SourcesDirectory)" -maxdepth 1 -name "${ARTIFACT_ID}-*.jar" -delete || true
+          rm -f "$(Build.SourcesDirectory)/MJAR-latest.jar" || true
+
+          # Ask Maven to resolve the latest timestamped SNAPSHOT and copy it here
+          mvn -B dependency:copy \
+            -Dtransitive=false \
+            "-DremoteRepositories=nexus::default::${SNAP_REPO}" \
+            "-Dartifact=${GROUP_ID}:${ARTIFACT_ID}:${VERSION}:jar" \
+            "-DoutputDirectory=$(Build.SourcesDirectory)"
+
+          LATEST_JAR="$(ls -1 "$(Build.SourcesDirectory)"/${ARTIFACT_ID}-*.jar | sort | tail -n1)"
+
+          cp -f "$LATEST_JAR" "$(Build.SourcesDirectory)/MJAR-latest.jar"
+
+          echo "Fetched and renamed:"
+          ls -lh "$(Build.SourcesDirectory)/MJAR-latest.jar"
+    
+    - task: Docker@2
+      inputs:
+        command: 'build'
+        Dockerfile: '**/Dockerfile'
+        tags: 'latest'
+        arguments: '-t maven-app'
+      
+    - task: ECRPushImage@1
+      inputs:
+        awsCredentials: 'aws-sp'
+        regionName: 'eu-north-1'
+        imageSource: 'imagename'
+        sourceImageName: 'maven-app'
+        repositoryName: 'k8s-lab'
+        pushTag: 'v.1$(Build.BuildId)'
+        removeDockerImage: true
+
+- stage: deploy
+  dependsOn: fetchJar
+  jobs:
+  - job: deploy
+    steps:
+    - task: Bash@3
+      inputs:
+        targetType: 'inline'
+        script: |
+          cd k8s-deployment
+          sed -i 's|image: <image_name>|image: $(IMAGE_NAME):v.1$(Build.BuildId)|' deployment.yaml
+          kubectl apply -f deployment.yaml
+          kubectl apply -f service.yaml
+          kubectl apply -f ingress.yaml
